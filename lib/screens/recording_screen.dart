@@ -1,10 +1,11 @@
 import 'dart:io';
 
-import 'package:camera/camera.dart';
+import 'package:camerawesome/camerawesome_plugin.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/app_providers.dart';
+import '../services/camera_service.dart';
 import '../services/permissions_service.dart';
 import '../services/recording_session_controller.dart';
 import '../theme/app_theme.dart';
@@ -20,38 +21,37 @@ class RecordingScreen extends ConsumerStatefulWidget {
 }
 
 class _RecordingScreenState extends ConsumerState<RecordingScreen> {
-  bool _initializing = true;
+  bool _permissionReady = false;
   String? _initError;
   bool _canOpenSettings = false;
   bool _navigatedToDetail = false;
+  bool _handlingFaceLost = false;
 
   @override
   void initState() {
     super.initState();
-    _initCamera();
+    _requestPermissions();
   }
 
-  Future<void> _initCamera() async {
-    setState(() {
-      _initializing = true;
-      _initError = null;
-      _canOpenSettings = false;
-    });
+  Future<void> _requestPermissions() async {
     try {
-      await ref.read(recordingControllerProvider).prepareCamera();
+      await AppPermissions.ensureCameraPermissions();
       if (!mounted) return;
-      setState(() => _initializing = false);
+      setState(() {
+        _permissionReady = true;
+        _initError = null;
+      });
     } on PermissionDeniedException catch (e) {
       if (!mounted) return;
       setState(() {
-        _initializing = false;
+        _permissionReady = false;
         _initError = e.message;
         _canOpenSettings = e.canOpenSettings;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _initializing = false;
+        _permissionReady = false;
         _initError = '$e';
       });
     }
@@ -59,6 +59,10 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
 
   Future<bool> _onWillPop() async {
     final phase = ref.read(recordingControllerProvider).state.phase;
+    if (phase == RecordingPhase.waitingForFace) {
+      await ref.read(recordingControllerProvider).cancelSession();
+      return true;
+    }
     if (phase == RecordingPhase.recording ||
         phase == RecordingPhase.preparing ||
         phase == RecordingPhase.saving) {
@@ -93,34 +97,34 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
 
   Future<void> _start() async {
     final draft = ref.read(sessionDraftProvider);
-    final face = ref.read(cameraServiceProvider).faceState;
-    if (!face.detected) {
-      final proceed = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('No face detected'),
-          content: const Text(
-            'For rPPG quality, center your face in the oval before recording. Start anyway?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Wait'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Start anyway'),
-            ),
-          ],
-        ),
-      );
-      if (proceed != true) return;
-    }
-
     await ref.read(recordingControllerProvider).startSession(
           subjectId: draft.subjectId,
           notes: draft.notes,
         );
+  }
+
+  Future<void> _handleFaceLost(String message) async {
+    if (_handlingFaceLost) return;
+    _handlingFaceLost = true;
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Face lost'),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Start again'),
+          ),
+        ],
+      ),
+    );
+
+    await ref.read(recordingControllerProvider).acknowledgeFaceLost();
+    _handlingFaceLost = false;
   }
 
   @override
@@ -132,7 +136,8 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
         ref.read(polarServiceProvider).state;
     final face = ref.watch(faceOverlayProvider).asData?.value ??
         ref.read(cameraServiceProvider).faceState;
-    final camera = ref.watch(cameraServiceProvider);
+    final cameraReady = ref.watch(cameraReadyProvider).asData?.value ??
+        ref.read(cameraServiceProvider).isInitialized;
 
     ref.listen<AsyncValue<RecordingUiState>>(recordingStateProvider, (
       prev,
@@ -173,6 +178,13 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
         });
       }
 
+      if (state.phase == RecordingPhase.faceLost &&
+          state.errorMessage != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _handleFaceLost(state.errorMessage!);
+        });
+      }
+
       if (state.phase == RecordingPhase.error && state.errorMessage != null) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(state.errorMessage!)),
@@ -181,8 +193,14 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
     });
 
     final isRecording = recording.phase == RecordingPhase.recording;
-    final isBusy = recording.phase == RecordingPhase.preparing ||
-        recording.phase == RecordingPhase.saving;
+    final isWaitingForFace = recording.phase == RecordingPhase.waitingForFace;
+    final isPreparing = recording.phase == RecordingPhase.preparing;
+    final isSaving = recording.phase == RecordingPhase.saving;
+    final canCancelTake =
+        isWaitingForFace || isRecording || isPreparing;
+    final faceLockFraction = (recording.faceLockProgressMs /
+            RecordingSessionController.faceLockDuration.inMilliseconds)
+        .clamp(0.0, 1.0);
 
     return PopScope(
       canPop: false,
@@ -195,186 +213,236 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
       },
       child: Scaffold(
         backgroundColor: Colors.black,
-        body: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                child: Row(
-                  children: [
-                    IconButton(
-                      onPressed: isRecording || isBusy
-                          ? null
-                          : () async {
-                              final allow = await _onWillPop();
-                              if (allow && context.mounted) {
-                                Navigator.of(context).pop();
-                              }
-                            },
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                    ),
-                    const Expanded(
-                      child: Text(
-                        'Recording',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ),
-                    ConnectionStatusChip(state: polar, compact: true),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: _buildPreview(
-                  controller: camera.controller,
-                  initializing: _initializing,
-                  initError: _initError,
-                  canOpenSettings: _canOpenSettings,
-                  faceDetected: face.detected,
-                  isRecording: isRecording,
-                  onRetry: _initCamera,
-                ),
-              ),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-                color: AppColors.background,
-                child: Column(
-                  children: [
-                    if (isRecording ||
-                        recording.phase == RecordingPhase.preparing) ...[
-                      RecordingProgressBar(
-                        progress: recording.progress,
-                        remainingSeconds: recording.remainingSeconds,
-                      ),
-                      const SizedBox(height: 16),
-                      OutlinedButton(
-                        onPressed: isBusy
-                            ? null
-                            : () => ref
-                                .read(recordingControllerProvider)
-                                .cancelSession(),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: AppColors.error,
-                          side: const BorderSide(color: AppColors.error),
-                        ),
-                        child: const Text('Cancel recording'),
-                      ),
-                    ] else if (recording.phase == RecordingPhase.saving) ...[
-                      const CircularProgressIndicator(),
-                      const SizedBox(height: 12),
-                      const Text('Saving session…'),
-                    ] else ...[
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
+        // Stack chrome above the camera so CamerAwesome gestures cannot steal taps.
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(
+              child: IgnorePointer(child: _buildCameraArea()),
+            ),
+            SafeArea(
+              child: Column(
+                children: [
+                  Material(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(4, 4, 12, 4),
+                      child: Row(
                         children: [
-                          Icon(
-                            face.detected
-                                ? Icons.face
-                                : Icons.face_retouching_off,
-                            color: face.detected
-                                ? AppColors.accent
-                                : AppColors.textSecondary,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            face.detected ? 'Face ready' : 'Waiting for face',
-                            style: TextStyle(
-                              color: face.detected
-                                  ? AppColors.accent
-                                  : AppColors.textSecondary,
-                              fontSize: 13,
+                          IconButton(
+                            onPressed: isSaving
+                                ? null
+                                : () async {
+                                    final allow = await _onWillPop();
+                                    if (allow && context.mounted) {
+                                      Navigator.of(context).pop();
+                                    }
+                                  },
+                            icon: const Icon(
+                              Icons.arrow_back,
+                              color: Colors.white,
                             ),
                           ),
-                          const SizedBox(width: 16),
-                          Text(
-                            polar.heartRate != null
-                                ? '${polar.heartRate} bpm'
-                                : 'No HR',
-                            style: const TextStyle(
-                              color: AppColors.textPrimary,
-                              fontWeight: FontWeight.w600,
+                          const Expanded(
+                            child: Text(
+                              'Recording',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 16,
+                              ),
                             ),
                           ),
+                          ConnectionStatusChip(state: polar, compact: true),
                         ],
                       ),
-                      const SizedBox(height: 16),
-                      SizedBox(
-                        width: double.infinity,
-                        child: FilledButton(
-                          onPressed: (!polar.isStreaming ||
-                                  _initializing ||
-                                  _initError != null)
-                              ? null
-                              : _start,
-                          style: FilledButton.styleFrom(
-                            backgroundColor: AppColors.recording,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                          ),
-                          child: const Text(
-                            'Start 30s recording',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const Spacer(),
+                  Material(
+                    color: AppColors.background,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (isWaitingForFace) ...[
+                            Text(
+                              face.detected
+                                  ? 'Hold still — locking face…'
+                                  : 'Center your face to start the 30s timer',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: face.detected
+                                    ? AppColors.accent
+                                    : AppColors.warning,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 14,
+                              ),
                             ),
-                          ),
-                        ),
+                            const SizedBox(height: 12),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: faceLockFraction,
+                                minHeight: 6,
+                                backgroundColor: AppColors.surfaceAlt,
+                                color: AppColors.accent,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton(
+                                onPressed: () => ref
+                                    .read(recordingControllerProvider)
+                                    .cancelSession(),
+                                child: const Text('Cancel'),
+                              ),
+                            ),
+                          ] else if (isRecording || isPreparing) ...[
+                            RecordingProgressBar(
+                              progress: recording.progress,
+                              remainingSeconds: recording.remainingSeconds,
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              face.detected
+                                  ? 'Face visible — keep still'
+                                  : 'Face lost — hold position!',
+                              style: TextStyle(
+                                color: face.detected
+                                    ? AppColors.accent
+                                    : AppColors.recording,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 13,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton(
+                                onPressed: canCancelTake
+                                    ? () => ref
+                                        .read(recordingControllerProvider)
+                                        .cancelSession()
+                                    : null,
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: AppColors.error,
+                                  side: const BorderSide(
+                                    color: AppColors.error,
+                                  ),
+                                ),
+                                child: const Text('Cancel recording'),
+                              ),
+                            ),
+                          ] else if (isSaving) ...[
+                            const CircularProgressIndicator(),
+                            const SizedBox(height: 12),
+                            const Text('Saving session…'),
+                          ] else ...[
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  face.detected
+                                      ? Icons.face
+                                      : Icons.face_retouching_off,
+                                  color: face.detected
+                                      ? AppColors.accent
+                                      : AppColors.textSecondary,
+                                  size: 18,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  face.detected
+                                      ? 'Face in view'
+                                      : 'Looking for face',
+                                  style: TextStyle(
+                                    color: face.detected
+                                        ? AppColors.accent
+                                        : AppColors.textSecondary,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const SizedBox(width: 16),
+                                Text(
+                                  polar.heartRate != null
+                                      ? '${polar.heartRate} bpm'
+                                      : 'No HR',
+                                  style: const TextStyle(
+                                    color: AppColors.textPrimary,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 16),
+                            SizedBox(
+                              width: double.infinity,
+                              child: FilledButton(
+                                onPressed: (!polar.isStreaming ||
+                                        !cameraReady ||
+                                        _initError != null)
+                                    ? null
+                                    : _start,
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: AppColors.recording,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 16,
+                                  ),
+                                ),
+                                child: const Text(
+                                  'Start 30s recording',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            StatusBanner(
+                              message: !polar.isStreaming
+                                  ? 'Polar must be streaming before recording.'
+                                  : 'Timer starts only after your face is locked in the oval. Keep it visible for the full 30 seconds.',
+                              tone: !polar.isStreaming
+                                  ? BannerTone.warning
+                                  : BannerTone.info,
+                            ),
+                          ],
+                        ],
                       ),
-                      if (!polar.isStreaming) ...[
-                        const SizedBox(height: 10),
-                        const StatusBanner(
-                          message: 'Polar must be streaming before recording.',
-                          tone: BannerTone.warning,
-                        ),
-                      ],
-                    ],
-                  ],
-                ),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Widget _buildPreview({
-    required CameraController? controller,
-    required bool initializing,
-    required String? initError,
-    required bool canOpenSettings,
-    required bool faceDetected,
-    required bool isRecording,
-    required VoidCallback onRetry,
-  }) {
-    if (initializing) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (initError != null) {
+  Widget _buildCameraArea() {
+    if (_initError != null) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              StatusBanner(
-                message: initError,
-                tone: BannerTone.error,
-              ),
+              StatusBanner(message: _initError!, tone: BannerTone.error),
               const SizedBox(height: 16),
-              if (canOpenSettings)
+              if (_canOpenSettings)
                 FilledButton(
                   onPressed: () => AppPermissions.openAppSettingsPage(),
                   child: const Text('Open Settings'),
                 ),
               const SizedBox(height: 8),
               OutlinedButton(
-                onPressed: onRetry,
+                onPressed: _requestPermissions,
                 child: const Text('Try again'),
               ),
             ],
@@ -383,44 +451,97 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen> {
       );
     }
 
-    if (controller == null || !controller.value.isInitialized) {
-      return const Center(
-        child: Text(
-          'Camera unavailable',
-          style: TextStyle(color: Colors.white),
-        ),
-      );
+    if (!_permissionReady) {
+      return const Center(child: CircularProgressIndicator());
     }
 
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        Center(
-          child: CameraPreview(controller),
-        ),
-        if (!isRecording) FaceGuideOverlay(faceDetected: faceDetected),
-        if (isRecording)
-          const Positioned(
-            top: 16,
-            left: 0,
-            right: 0,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+    // Keep CamerAwesome mounted stably; overlays listen to streams internally.
+    return _StableCameraPreview(camera: ref.read(cameraServiceProvider));
+  }
+}
+
+class _StableCameraPreview extends StatefulWidget {
+  const _StableCameraPreview({required this.camera});
+
+  final CameraService camera;
+
+  @override
+  State<_StableCameraPreview> createState() => _StableCameraPreviewState();
+}
+
+class _StableCameraPreviewState extends State<_StableCameraPreview> {
+  late final SaveConfig _saveConfig = widget.camera.buildSaveConfig();
+
+  @override
+  Widget build(BuildContext context) {
+    return CameraAwesomeBuilder.custom(
+      saveConfig: _saveConfig,
+      sensorConfig: SensorConfig.single(
+        sensor: Sensor.position(SensorPosition.front),
+        aspectRatio: CameraAspectRatios.ratio_4_3,
+        flashMode: FlashMode.none,
+      ),
+      previewFit: CameraPreviewFit.cover,
+      onImageForAnalysis: widget.camera.processAnalysisImage,
+      imageAnalysisConfig: widget.camera.analysisConfig(),
+      builder: (state, preview) {
+        widget.camera.attachCameraState(state);
+        return _LiveFaceOverlay(camera: widget.camera);
+      },
+    );
+  }
+}
+
+class _LiveFaceOverlay extends StatelessWidget {
+  const _LiveFaceOverlay({required this.camera});
+
+  final CameraService camera;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<FaceOverlayState>(
+      stream: camera.faceStream,
+      initialData: camera.faceState,
+      builder: (context, faceSnap) {
+        final faceDetected = faceSnap.data?.detected ?? false;
+        return StreamBuilder<bool>(
+          stream: camera.recordingStream,
+          initialData: camera.isRecordingVideo,
+          builder: (context, recordingSnap) {
+            final isRecording = recordingSnap.data ?? false;
+            return Stack(
+              fit: StackFit.expand,
               children: [
-                Icon(Icons.fiber_manual_record, color: AppColors.recording),
-                SizedBox(width: 6),
-                Text(
-                  'RECORDING',
-                  style: TextStyle(
-                    color: AppColors.recording,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.2,
+                FaceGuideOverlay(faceDetected: faceDetected),
+                if (isRecording)
+                  const Positioned(
+                    top: 16,
+                    left: 0,
+                    right: 0,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.fiber_manual_record,
+                          color: AppColors.recording,
+                        ),
+                        SizedBox(width: 6),
+                        Text(
+                          'RECORDING',
+                          style: TextStyle(
+                            color: AppColors.recording,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
               ],
-            ),
-          ),
-      ],
+            );
+          },
+        );
+      },
     );
   }
 }

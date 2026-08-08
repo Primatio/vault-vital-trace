@@ -15,11 +15,14 @@ import 'session_storage_service.dart';
 
 enum RecordingPhase {
   idle,
+  /// Armed: waiting for a stable face before the 30s clock starts.
+  waitingForFace,
   preparing,
   recording,
   saving,
   completed,
   cancelled,
+  faceLost,
   error,
 }
 
@@ -32,6 +35,7 @@ class RecordingUiState {
   final String? completedDirectory;
   final bool faceDetected;
   final int? heartRate;
+  final int faceLockProgressMs;
 
   const RecordingUiState({
     this.phase = RecordingPhase.idle,
@@ -42,6 +46,7 @@ class RecordingUiState {
     this.completedDirectory,
     this.faceDetected = false,
     this.heartRate,
+    this.faceLockProgressMs = 0,
   });
 
   RecordingUiState copyWith({
@@ -53,6 +58,7 @@ class RecordingUiState {
     String? completedDirectory,
     bool? faceDetected,
     int? heartRate,
+    int? faceLockProgressMs,
     bool clearError = false,
   }) {
     return RecordingUiState(
@@ -64,11 +70,12 @@ class RecordingUiState {
       completedDirectory: completedDirectory ?? this.completedDirectory,
       faceDetected: faceDetected ?? this.faceDetected,
       heartRate: heartRate ?? this.heartRate,
+      faceLockProgressMs: faceLockProgressMs ?? this.faceLockProgressMs,
     );
   }
 }
 
-/// Orchestrates synchronized 30s video + Polar recording.
+/// Orchestrates synchronized 30s video + Polar recording with live face gating.
 class RecordingSessionController {
   RecordingSessionController({
     required this.polarService,
@@ -82,10 +89,23 @@ class RecordingSessionController {
 
   static const recordingDuration = Duration(seconds: 30);
 
+  /// Face must stay visible this long before the 30s take begins.
+  static const faceLockDuration = Duration(milliseconds: 600);
+
+  /// Face must be missing this long before the take is discarded.
+  static const faceLostGrace = Duration(milliseconds: 800);
+
   final _stateController = StreamController<RecordingUiState>.broadcast();
   RecordingUiState _state = const RecordingUiState();
 
   Timer? _countdownTimer;
+  Timer? _faceLockTimer;
+  StreamSubscription<FaceOverlayState>? _faceSub;
+  DateTime? _faceLostSince;
+  DateTime? _faceVisibleSince;
+  bool _aborting = false;
+  bool _startingTake = false;
+
   DateTime? _startUtc;
   int? _startMonotonicMs;
   String? _subjectId;
@@ -107,18 +127,15 @@ class RecordingSessionController {
     }
   }
 
-  Future<void> prepareCamera() async {
-    await AppPermissions.ensureCameraPermissions();
-    await cameraService.initialize();
-  }
-
-  /// Starts a fixed 30-second synchronized recording session.
+  /// Arms a session. The 30s clock starts only after a stable face lock.
   Future<void> startSession({
     required String subjectId,
     String? notes,
   }) async {
     if (_state.phase == RecordingPhase.recording ||
-        _state.phase == RecordingPhase.saving) {
+        _state.phase == RecordingPhase.saving ||
+        _state.phase == RecordingPhase.preparing ||
+        _state.phase == RecordingPhase.waitingForFace) {
       return;
     }
 
@@ -144,15 +161,88 @@ class RecordingSessionController {
 
     _subjectId = subjectId.trim().isEmpty ? 'unknown' : subjectId.trim();
     _notes = notes?.trim().isEmpty == true ? null : notes?.trim();
+    _aborting = false;
+    _startingTake = false;
+    _faceLostSince = null;
+    _faceVisibleSince =
+        cameraService.faceState.detected ? DateTime.now() : null;
+
+    _emit(
+      _state.copyWith(
+        phase: RecordingPhase.waitingForFace,
+        remainingSeconds: recordingDuration.inSeconds,
+        progress: 0,
+        faceLockProgressMs: 0,
+        clearError: true,
+        faceDetected: cameraService.faceState.detected,
+        heartRate: polarService.state.heartRate,
+      ),
+    );
+
+    _startFaceLockWatcher();
+  }
+
+  void _startFaceLockWatcher() {
+    _faceSub?.cancel();
+    _faceLockTimer?.cancel();
+
+    // Poll so lock progress advances even when face state stops emitting.
+    _faceLockTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+      if (_state.phase != RecordingPhase.waitingForFace || _startingTake) {
+        return;
+      }
+
+      final detected = cameraService.faceState.detected;
+      if (!detected) {
+        if (_faceVisibleSince != null || _state.faceDetected) {
+          _faceVisibleSince = null;
+          _emit(
+            _state.copyWith(
+              faceDetected: false,
+              faceLockProgressMs: 0,
+              heartRate: polarService.state.heartRate,
+            ),
+          );
+        }
+        return;
+      }
+
+      _faceVisibleSince ??= DateTime.now();
+      final held = DateTime.now().difference(_faceVisibleSince!);
+      _emit(
+        _state.copyWith(
+          faceDetected: true,
+          faceLockProgressMs: held.inMilliseconds.clamp(
+            0,
+            faceLockDuration.inMilliseconds,
+          ),
+          heartRate: polarService.state.heartRate,
+        ),
+      );
+
+      if (held >= faceLockDuration) {
+        _faceLockTimer?.cancel();
+        _faceLockTimer = null;
+        unawaited(_beginTimedRecording());
+      }
+    });
+  }
+
+  Future<void> _beginTimedRecording() async {
+    if (_startingTake || _state.phase != RecordingPhase.waitingForFace) {
+      return;
+    }
+    _startingTake = true;
+    _faceLockTimer?.cancel();
+    _faceLockTimer = null;
+    await _faceSub?.cancel();
+    _faceSub = null;
 
     _emit(
       _state.copyWith(
         phase: RecordingPhase.preparing,
-        remainingSeconds: recordingDuration.inSeconds,
-        progress: 0,
-        clearError: true,
-        faceDetected: cameraService.faceState.detected,
-        heartRate: polarService.state.heartRate,
+        faceDetected: true,
+        faceLockProgressMs: faceLockDuration.inMilliseconds,
       ),
     );
 
@@ -165,23 +255,11 @@ class RecordingSessionController {
       );
       _sessionDir = await storage.createSessionDirectory(_folderName!);
 
-      // Capture face presence at the sync point before video encode starts
-      // (camera plugin cannot run image-stream analysis during video recording).
-      final faceAtStart = cameraService.faceState.detected;
+      // Sync epoch = first frame of the timed take (face already locked).
       cameraService.beginFaceEventBuffer(startMonotonicMs: _startMonotonicMs!);
-      // Seed one face event at t≈0 for alignment / quality checks.
-      cameraService.seedFaceEvent(
-        FaceTrackingEvent(
-          timestampMs: 0,
-          faceDetected: faceAtStart,
-          faceCount: faceAtStart ? 1 : 0,
-        ),
-      );
-
-      // Sync point: start buffering Polar, then video.
       polarService.beginRecordingBuffer(startMonotonicMs: _startMonotonicMs!);
-      await cameraService.startVideoRecording();
 
+      await cameraService.startVideoRecording();
       await _hapticStart();
 
       _emit(
@@ -189,22 +267,82 @@ class RecordingSessionController {
           phase: RecordingPhase.recording,
           remainingSeconds: recordingDuration.inSeconds,
           progress: 0,
-          faceDetected: faceAtStart,
+          faceDetected: true,
           heartRate: polarService.state.heartRate,
         ),
       );
 
+      _listenForFaceDuringRecording();
       _startCountdown();
     } catch (e) {
-      polarService.discardRecordingBuffer();
-      cameraService.endFaceEventBuffer();
+      await _cleanupFailedStart();
       _emit(
         _state.copyWith(
           phase: RecordingPhase.error,
           errorMessage: 'Failed to start recording: $e',
         ),
       );
+    } finally {
+      _startingTake = false;
     }
+  }
+
+  void _listenForFaceDuringRecording() {
+    _faceSub?.cancel();
+    _faceSub = cameraService.faceStream.listen((face) {
+      if (_state.phase != RecordingPhase.recording || _aborting) return;
+
+      _emit(_state.copyWith(faceDetected: face.detected));
+
+      if (face.detected) {
+        _faceLostSince = null;
+        return;
+      }
+
+      _faceLostSince ??= DateTime.now();
+      if (DateTime.now().difference(_faceLostSince!) >= faceLostGrace) {
+        unawaited(_abortDueToFaceLost());
+      }
+    });
+  }
+
+  Future<void> _abortDueToFaceLost() async {
+    if (_aborting) return;
+    if (_state.phase != RecordingPhase.recording) return;
+    _aborting = true;
+
+    _countdownTimer?.cancel();
+    await _faceSub?.cancel();
+    _faceSub = null;
+
+    _emit(
+      _state.copyWith(
+        phase: RecordingPhase.saving,
+        faceDetected: false,
+      ),
+    );
+
+    try {
+      await cameraService.cancelVideoRecording();
+      polarService.discardRecordingBuffer();
+      cameraService.endFaceEventBuffer();
+      if (_sessionDir != null && await _sessionDir!.exists()) {
+        await _sessionDir!.delete(recursive: true);
+      }
+    } catch (e) {
+      debugPrint('Face-lost cleanup error: $e');
+    }
+
+    await _hapticStop();
+
+    _emit(
+      const RecordingUiState(
+        phase: RecordingPhase.faceLost,
+        errorMessage:
+            'Face left the frame. Recording discarded — keep your face visible and start again.',
+      ),
+    );
+    _aborting = false;
   }
 
   void _startCountdown() {
@@ -215,6 +353,11 @@ class RecordingSessionController {
     _countdownTimer = Timer.periodic(const Duration(milliseconds: 100), (
       timer,
     ) async {
+      if (_aborting || _state.phase != RecordingPhase.recording) {
+        timer.cancel();
+        return;
+      }
+
       final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
       final remainingMs = (totalMs - elapsed).clamp(0, totalMs);
       final remainingSec = (remainingMs / 1000).ceil();
@@ -225,7 +368,6 @@ class RecordingSessionController {
           remainingSeconds: remainingSec,
           progress: progress,
           heartRate: polarService.state.heartRate,
-          // During video encode, face stream is paused — keep last known.
           faceDetected: cameraService.faceState.detected,
         ),
       );
@@ -239,29 +381,66 @@ class RecordingSessionController {
 
   Future<void> cancelSession() async {
     if (_state.phase != RecordingPhase.recording &&
-        _state.phase != RecordingPhase.preparing) {
+        _state.phase != RecordingPhase.preparing &&
+        _state.phase != RecordingPhase.waitingForFace) {
       return;
     }
+
     _countdownTimer?.cancel();
+    _faceLockTimer?.cancel();
+    _faceLockTimer = null;
+    await _faceSub?.cancel();
+    _faceSub = null;
+
+    if (_state.phase == RecordingPhase.waitingForFace) {
+      _faceVisibleSince = null;
+      _emit(
+        RecordingUiState(
+          phase: RecordingPhase.idle,
+          faceDetected: cameraService.faceState.detected,
+          heartRate: polarService.state.heartRate,
+        ),
+      );
+      return;
+    }
+
     await _finish(cancelled: true);
   }
 
-  Future<void> _finish({required bool cancelled}) async {
+  Future<void> _cleanupFailedStart() async {
     _countdownTimer?.cancel();
+    _faceLockTimer?.cancel();
+    _faceLockTimer = null;
+    await _faceSub?.cancel();
+    _faceSub = null;
+    polarService.discardRecordingBuffer();
+    cameraService.endFaceEventBuffer();
+    try {
+      await cameraService.cancelVideoRecording();
+    } catch (_) {}
+    if (_sessionDir != null && await _sessionDir!.exists()) {
+      await _sessionDir!.delete(recursive: true);
+    }
+  }
+
+  Future<void> _finish({required bool cancelled}) async {
+    if (_aborting) return;
+    _countdownTimer?.cancel();
+    await _faceSub?.cancel();
+    _faceSub = null;
     _emit(_state.copyWith(phase: RecordingPhase.saving));
 
     try {
       final endUtc = DateTime.now().toUtc();
       final endMonotonic = MonotonicClock.nowMs();
 
-      XFilePath? videoPath;
+      String? videoPath;
       if (cancelled) {
         await cameraService.cancelVideoRecording();
         polarService.discardRecordingBuffer();
         cameraService.endFaceEventBuffer();
       } else {
-        final video = await cameraService.stopVideoRecording();
-        videoPath = video == null ? null : XFilePath(video.path);
+        videoPath = await cameraService.stopVideoRecording();
       }
 
       final polarSamples =
@@ -274,14 +453,31 @@ class RecordingSessionController {
           await _sessionDir!.delete(recursive: true);
         }
         await _hapticStop();
+        _emit(const RecordingUiState(phase: RecordingPhase.cancelled));
+        return;
+      }
+
+      final faceLostEvents = faceEvents.where((e) => !e.faceDetected).length;
+      if (faceEvents.isNotEmpty &&
+          faceLostEvents > faceEvents.length * 0.25) {
+        if (videoPath != null) {
+          final f = File(videoPath);
+          if (await f.exists()) await f.delete();
+        }
+        if (_sessionDir != null && await _sessionDir!.exists()) {
+          await _sessionDir!.delete(recursive: true);
+        }
         _emit(
-          const RecordingUiState(phase: RecordingPhase.cancelled),
+          const RecordingUiState(
+            phase: RecordingPhase.faceLost,
+            errorMessage:
+                'Face was not visible for enough of the recording. Please start again.',
+          ),
         );
         return;
       }
 
       final polarState = polarService.state;
-      final previewSize = cameraService.controller?.value.previewSize;
       final deviceInfo = await AppPermissions.collectDeviceInfo();
 
       final metadata = SessionMetadata(
@@ -300,26 +496,20 @@ class RecordingSessionController {
           batteryLevel: polarState.batteryLevel,
         ),
         recordingSettings: RecordingSettings(
-          width: previewSize?.height.toInt(),
-          height: previewSize?.width.toInt(),
           fps: 30,
           hrStream: polarState.hrStreaming,
           rrStream: polarState.hrStreaming,
           ecgStream: polarState.ecgStreaming,
           accStream: polarState.accStreaming,
           cameraLens: 'front',
-          resolutionPreset: 'high',
+          resolutionPreset: 'hd',
         ),
         notes: _notes,
         status: SessionStatus.complete,
-        faceDetectedAtStart: faceEvents.isNotEmpty
-            ? faceEvents.first.faceDetected
-            : cameraService.faceState.detected,
+        faceDetectedAtStart: true,
         faceDetectionEventCount: faceEvents.length,
         appVersion: deviceInfo.appVersion,
       );
-
-      final finalized = metadata;
 
       if (_sessionDir == null) {
         throw StateError('Session directory missing');
@@ -328,13 +518,13 @@ class RecordingSessionController {
       if (videoPath != null) {
         await storage.moveVideoIntoSession(
           dir: _sessionDir!,
-          sourcePath: videoPath.path,
+          sourcePath: videoPath,
         );
       }
 
       await storage.writePolarCsv(_sessionDir!, polarSamples);
       await storage.writeFaceTracking(_sessionDir!, faceEvents);
-      await storage.writeMetadata(_sessionDir!, finalized);
+      await storage.writeMetadata(_sessionDir!, metadata);
 
       await _hapticStop();
 
@@ -343,7 +533,7 @@ class RecordingSessionController {
           phase: RecordingPhase.completed,
           remainingSeconds: 0,
           progress: 1,
-          completedMetadata: finalized,
+          completedMetadata: metadata,
           completedDirectory: _sessionDir!.path,
         ),
       );
@@ -353,6 +543,18 @@ class RecordingSessionController {
         _state.copyWith(
           phase: RecordingPhase.error,
           errorMessage: 'Failed to save session: $e',
+        ),
+      );
+    }
+  }
+
+  Future<void> acknowledgeFaceLost() async {
+    if (_state.phase == RecordingPhase.faceLost) {
+      _emit(
+        RecordingUiState(
+          phase: RecordingPhase.idle,
+          faceDetected: cameraService.faceState.detected,
+          heartRate: polarService.state.heartRate,
         ),
       );
     }
@@ -378,17 +580,18 @@ class RecordingSessionController {
 
   void reset() {
     _countdownTimer?.cancel();
+    _faceLockTimer?.cancel();
+    _faceLockTimer = null;
+    _faceSub?.cancel();
+    _faceSub = null;
+    _faceVisibleSince = null;
     _emit(const RecordingUiState());
   }
 
   void dispose() {
     _countdownTimer?.cancel();
+    _faceLockTimer?.cancel();
+    _faceSub?.cancel();
     _stateController.close();
   }
-}
-
-/// Tiny helper to avoid importing camera XFile in this file's public API.
-class XFilePath {
-  final String path;
-  const XFilePath(this.path);
 }

@@ -2,131 +2,185 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
 
-import 'package:camera/camera.dart';
+import 'package:camerawesome/camerawesome_plugin.dart';
+import 'package:camerawesome/pigeon.dart';
 import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import '../models/polar_sample.dart';
+import '../utils/mlkit_utils.dart';
 import '../utils/monotonic_clock.dart';
 
 class FaceOverlayState {
   final bool detected;
   final int faceCount;
   final Rect? boundingBox;
-  final Size? imageSize;
-  final InputImageRotation? rotation;
 
   const FaceOverlayState({
     this.detected = false,
     this.faceCount = 0,
     this.boundingBox,
-    this.imageSize,
-    this.rotation,
   });
-
-  FaceOverlayState copyWith({
-    bool? detected,
-    int? faceCount,
-    Rect? boundingBox,
-    Size? imageSize,
-    InputImageRotation? rotation,
-  }) {
-    return FaceOverlayState(
-      detected: detected ?? this.detected,
-      faceCount: faceCount ?? this.faceCount,
-      boundingBox: boundingBox ?? this.boundingBox,
-      imageSize: imageSize ?? this.imageSize,
-      rotation: rotation ?? this.rotation,
-    );
-  }
 }
 
+/// Bridges CamerAwesome (widget-owned camera) with face detection + video control.
 class CameraService {
-  CameraController? _controller;
+  CameraService() {
+    // Lean detector: presence only — classification is expensive.
+    _faceDetector = FaceDetector(
+      options: FaceDetectorOptions(
+        enableClassification: false,
+        enableTracking: true,
+        enableLandmarks: false,
+        enableContours: false,
+        performanceMode: FaceDetectorMode.fast,
+        minFaceSize: 0.2,
+      ),
+    );
+  }
+
   FaceDetector? _faceDetector;
-  bool _isStreaming = false;
   bool _isBusy = false;
   bool _isRecordingVideo = false;
+  bool _cameraReady = false;
   int? _sessionStartMonotonicMs;
-  final List<FaceTrackingEvent> _faceEvents = [];
+  String? _currentVideoPath;
 
+  VideoCameraState? _videoState;
+  VideoRecordingCameraState? _recordingState;
+
+  final List<FaceTrackingEvent> _faceEvents = [];
   final _faceController = StreamController<FaceOverlayState>.broadcast();
+  final _readyController = StreamController<bool>.broadcast();
+  final _recordingController = StreamController<bool>.broadcast();
   FaceOverlayState _faceState = const FaceOverlayState();
 
-  CameraController? get controller => _controller;
-  bool get isInitialized => _controller?.value.isInitialized ?? false;
+  /// Tuned for preview smoothness + concurrent analysis.
+  static const analysisMaxFps = 4;
+  static const analysisWidth = 250;
+  static const faceEventMinIntervalMs = 250;
+
+  bool get isInitialized => _cameraReady;
   bool get isRecordingVideo => _isRecordingVideo;
+  FaceOverlayState get faceState => _faceState;
+  String? get currentVideoPath => _currentVideoPath;
+
   Stream<FaceOverlayState> get faceStream async* {
     yield _faceState;
     yield* _faceController.stream;
   }
-  FaceOverlayState get faceState => _faceState;
-  List<FaceTrackingEvent> get faceEvents =>
-      List<FaceTrackingEvent>.unmodifiable(_faceEvents);
 
-  Future<CameraDescription> _frontCamera() async {
-    final cameras = await availableCameras();
-    return cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => cameras.first,
+  Stream<bool> get readyStream async* {
+    yield _cameraReady;
+    yield* _readyController.stream;
+  }
+
+  Stream<bool> get recordingStream async* {
+    yield _isRecordingVideo;
+    yield* _recordingController.stream;
+  }
+
+  /// Shared analysis config for CamerAwesome (keep in sync with detector load).
+  AnalysisConfig analysisConfig() {
+    return AnalysisConfig(
+      androidOptions: const AndroidAnalysisOptions.nv21(width: analysisWidth),
+      maxFramesPerSecond: analysisMaxFps.toDouble(),
+      autoStart: true,
     );
   }
 
-  Future<void> initialize({
-    ResolutionPreset preset = ResolutionPreset.high,
-  }) async {
-    await dispose();
-
-    final camera = await _frontCamera();
-    final controller = CameraController(
-      camera,
-      preset,
-      enableAudio: false,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
+  /// Called from [CameraAwesomeBuilder] whenever the camera state changes.
+  void attachCameraState(CameraState state) {
+    state.when(
+      onPreparingCamera: (_) {
+        _videoState = null;
+        _recordingState = null;
+        _setReady(false);
+      },
+      onVideoMode: (videoState) {
+        _videoState = videoState;
+        _recordingState = null;
+        _setReady(true);
+      },
+      onVideoRecordingMode: (recordingState) {
+        _recordingState = recordingState;
+        _videoState = null;
+        _setReady(true);
+      },
+      onPhotoMode: (_) {},
+      onPreviewMode: (_) {},
+      onAnalysisOnlyMode: (_) {},
     );
-
-    await controller.initialize();
-    _controller = controller;
-
-    _faceDetector = FaceDetector(
-      options: FaceDetectorOptions(
-        enableClassification: true,
-        enableTracking: true,
-        performanceMode: FaceDetectorMode.fast,
-        minFaceSize: 0.15,
-      ),
-    );
-
-    await startFaceStream();
   }
 
-  Future<void> startFaceStream() async {
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) return;
-    if (_isStreaming || _isRecordingVideo) return;
-
-    _isStreaming = true;
-    await controller.startImageStream(_processCameraImage);
+  void _setReady(bool ready) {
+    if (_cameraReady == ready) return;
+    _cameraReady = ready;
+    if (!_readyController.isClosed) {
+      _readyController.add(ready);
+    }
   }
 
-  Future<void> stopFaceStream() async {
-    final controller = _controller;
-    if (!_isStreaming) return;
-    _isStreaming = false;
-    if (controller != null && controller.value.isStreamingImages) {
-      await controller.stopImageStream();
+  void _setRecording(bool recording) {
+    if (_isRecordingVideo == recording) return;
+    _isRecordingVideo = recording;
+    if (!_recordingController.isClosed) {
+      _recordingController.add(recording);
+    }
+  }
+
+  Future<void> processAnalysisImage(AnalysisImage image) async {
+    // Drop frames while a previous inference is in flight.
+    if (_isBusy || _faceDetector == null) return;
+    _isBusy = true;
+    try {
+      final input = image.toInputImage();
+      final faces = await _faceDetector!.processImage(input);
+      final primary = faces.isNotEmpty ? faces.first : null;
+      final detected = faces.isNotEmpty;
+
+      final next = FaceOverlayState(
+        detected: detected,
+        faceCount: faces.length,
+        boundingBox: primary?.boundingBox,
+      );
+
+      // Avoid flooding listeners when state is unchanged.
+      if (next.detected != _faceState.detected ||
+          next.faceCount != _faceState.faceCount) {
+        _faceState = next;
+        if (!_faceController.isClosed) {
+          _faceController.add(_faceState);
+        }
+      } else {
+        _faceState = next;
+      }
+
+      if (_sessionStartMonotonicMs != null) {
+        final ts = MonotonicClock.nowMs() - _sessionStartMonotonicMs!;
+        if (_faceEvents.isEmpty ||
+            ts - _faceEvents.last.timestampMs >= faceEventMinIntervalMs) {
+          _faceEvents.add(
+            FaceTrackingEvent(
+              timestampMs: ts,
+              faceDetected: detected,
+              faceCount: faces.length,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Face detection error: $e');
+    } finally {
+      _isBusy = false;
     }
   }
 
   void beginFaceEventBuffer({required int startMonotonicMs}) {
     _faceEvents.clear();
     _sessionStartMonotonicMs = startMonotonicMs;
-  }
-
-  void seedFaceEvent(FaceTrackingEvent event) {
-    _faceEvents.add(event);
   }
 
   List<FaceTrackingEvent> endFaceEventBuffer() {
@@ -136,143 +190,129 @@ class CameraService {
     return copy;
   }
 
-  Future<void> _processCameraImage(CameraImage image) async {
-    if (_isBusy || _faceDetector == null || _controller == null) return;
-    _isBusy = true;
-
-    try {
-      final input = _inputImageFromCameraImage(image);
-      if (input == null) return;
-
-      final faces = await _faceDetector!.processImage(input);
-      final primary = faces.isNotEmpty ? faces.first : null;
-
-      _faceState = FaceOverlayState(
-        detected: faces.isNotEmpty,
-        faceCount: faces.length,
-        boundingBox: primary?.boundingBox,
-        imageSize: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: input.metadata?.rotation,
-      );
-      _faceController.add(_faceState);
-
-      if (_sessionStartMonotonicMs != null) {
-        final ts = MonotonicClock.nowMs() - _sessionStartMonotonicMs!;
-        _faceEvents.add(
-          FaceTrackingEvent(
-            timestampMs: ts,
-            faceDetected: faces.isNotEmpty,
-            faceCount: faces.length,
-            smilingProbability: primary?.smilingProbability,
-            leftEyeOpenProbability: primary?.leftEyeOpenProbability,
-            rightEyeOpenProbability: primary?.rightEyeOpenProbability,
-            headEulerY: primary?.headEulerAngleY,
-            headEulerZ: primary?.headEulerAngleZ,
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint('Face detection error: $e');
-    } finally {
-      _isBusy = false;
-    }
+  Future<CaptureRequest> _buildVideoRequest(List<Sensor> sensors) async {
+    final dir = await getTemporaryDirectory();
+    final filePath = p.join(
+      dir.path,
+      'vault_rppg_${DateTime.now().millisecondsSinceEpoch}.mp4',
+    );
+    return SingleCaptureRequest(filePath, sensors.first);
   }
 
-  InputImage? _inputImageFromCameraImage(CameraImage image) {
-    final controller = _controller;
-    if (controller == null) return null;
-
-    final sensorOrientation = controller.description.sensorOrientation;
-    InputImageRotation? rotation;
-    if (Platform.isIOS) {
-      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    } else if (Platform.isAndroid) {
-      // Front camera preview is mirrored; sensor orientation is still used.
-      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    }
-    if (rotation == null) return null;
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    if (image.planes.isEmpty) return null;
-    final plane = image.planes.first;
-
-    return InputImage.fromBytes(
-      bytes: plane.bytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: plane.bytesPerRow,
+  SaveConfig buildSaveConfig() {
+    return SaveConfig.video(
+      pathBuilder: _buildVideoRequest,
+      mirrorFrontCamera: true,
+      videoOptions: VideoOptions(
+        enableAudio: false,
+        // HD is enough for rPPG and much lighter than "highest".
+        quality: VideoRecordingQuality.hd,
+        ios: CupertinoVideoOptions(
+          fps: 30,
+          codec: CupertinoCodecType.h264,
+          fileType: CupertinoFileType.mpeg4,
+        ),
+        android: AndroidVideoOptions(
+          bitrate: 4_000_000,
+          fallbackStrategy: QualityFallbackStrategy.lower,
+        ),
       ),
     );
   }
 
-  /// Stops the ML image stream (required by camera plugin), then starts video.
   Future<void> startVideoRecording() async {
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) {
-      throw StateError('Camera not ready');
+    final videoState = _videoState;
+    if (videoState == null) {
+      throw StateError('Camera not ready for video recording');
     }
     if (_isRecordingVideo) return;
 
-    await stopFaceStream();
-    await controller.startVideoRecording();
-    _isRecordingVideo = true;
-  }
+    await videoState.enableAudio(false);
+    final request = await videoState.startRecording();
+    _currentVideoPath = request.path;
+    _setRecording(true);
 
-  Future<XFile?> stopVideoRecording() async {
-    final controller = _controller;
-    if (controller == null || !_isRecordingVideo) return null;
-
-    final file = await controller.stopVideoRecording();
-    _isRecordingVideo = false;
-
-    // Resume face detection for subsequent takes.
-    await startFaceStream();
-    return file;
-  }
-
-  Future<void> cancelVideoRecording() async {
-    final controller = _controller;
-    if (controller == null || !_isRecordingVideo) return;
-    try {
-      final file = await controller.stopVideoRecording();
-      final f = File(file.path);
-      if (await f.exists()) {
-        await f.delete();
-      }
-    } catch (e) {
-      debugPrint('Cancel recording error: $e');
-    } finally {
-      _isRecordingVideo = false;
-      await startFaceStream();
+    for (var i = 0; i < 40 && _recordingState == null; i++) {
+      await Future.delayed(const Duration(milliseconds: 25));
     }
   }
 
-  Size? get previewSize {
-    final value = _controller?.value;
-    if (value == null || !value.isInitialized) return null;
-    return value.previewSize;
+  Future<String?> stopVideoRecording() async {
+    if (!_isRecordingVideo) return _currentVideoPath;
+
+    final recordingState = _recordingState;
+    if (recordingState == null) {
+      await CamerawesomePlugin.stopRecordingVideo();
+      _setRecording(false);
+      return _currentVideoPath;
+    }
+
+    final completer = Completer<String?>();
+    await recordingState.stopRecording(
+      onVideo: (request) {
+        _currentVideoPath = request.path;
+        if (!completer.isCompleted) completer.complete(request.path);
+      },
+      onVideoFailed: (exception) {
+        if (!completer.isCompleted) completer.completeError(exception);
+      },
+    );
+
+    final path = await completer.future.timeout(
+      const Duration(seconds: 8),
+      onTimeout: () => _currentVideoPath,
+    );
+    _setRecording(false);
+    return path;
   }
 
-  int? get previewWidth =>
-      _controller?.value.previewSize?.height.toInt(); // portrait swap
-  int? get previewHeight => _controller?.value.previewSize?.width.toInt();
+  Future<void> cancelVideoRecording() async {
+    if (!_isRecordingVideo && _recordingState == null) {
+      await _deleteCurrentVideo();
+      return;
+    }
+
+    try {
+      final path = await stopVideoRecording();
+      if (path != null) {
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    } catch (e) {
+      debugPrint('Cancel recording error: $e');
+      await _deleteCurrentVideo();
+    } finally {
+      _setRecording(false);
+      _currentVideoPath = null;
+    }
+  }
+
+  Future<void> _deleteCurrentVideo() async {
+    final path = _currentVideoPath;
+    if (path == null) return;
+    final file = File(path);
+    if (await file.exists()) {
+      await file.delete();
+    }
+    _currentVideoPath = null;
+  }
 
   Future<void> dispose() async {
-    await stopFaceStream();
     await _faceDetector?.close();
     _faceDetector = null;
-    await _controller?.dispose();
-    _controller = null;
-    _isRecordingVideo = false;
+    _videoState = null;
+    _recordingState = null;
+    _setRecording(false);
+    _cameraReady = false;
     _faceState = const FaceOverlayState();
   }
 
   Future<void> closeStreams() async {
     await dispose();
     await _faceController.close();
+    await _readyController.close();
+    await _recordingController.close();
   }
 }

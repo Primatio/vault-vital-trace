@@ -89,7 +89,7 @@ Rows are **heterogeneous**: a row may populate only ECG, only HR, or HR+RR. Empt
 }
 ```
 
-**Platform note:** The Flutter `camera` plugin cannot run an ML image stream concurrently with video encoding on most devices. Continuous face detection runs on the live preview; at recording start the app seeds a face event and records `face_detected_at_start`. Richer mid-recording face tracks are a post-MVP item (e.g. CameraX analysis use-case or offline video pass).
+Face detection runs continuously during the 30-second take (CamerAwesome image analysis + ML Kit). If the face leaves the frame for ~800 ms, the take is discarded and must be restarted. Events are sampled ~5 Hz into this file.
 
 ## Synchronization guidance for ML engineers
 

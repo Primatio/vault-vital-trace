@@ -44,8 +44,8 @@ Permissions for camera, Bluetooth scan/connect, and (legacy) location are declar
 
 1. Open **Connect Polar** → Scan → select your H10 → wait until HR is streaming
 2. **New Session** → enter Subject ID (+ optional notes)
-3. Center face in the oval → **Start 30s recording**
-4. Keep the app in the foreground until the countdown finishes
+3. Tap **Start 30s recording** → center face until it locks (~0.6s)
+4. The 30s timer starts only after face lock; leaving the frame discards the take
 5. Review the session → **Export / Share** into your training pipeline / bucket upload workflow
 
 ## Session folder layout
@@ -74,8 +74,8 @@ Every Polar CSV row uses `timestamp_ms` relative to that monotonic start. Expect
 | Layer | Choice |
 |-------|--------|
 | UI / state | Flutter + Riverpod |
-| Camera | `camera` |
-| Face detection | `google_mlkit_face_detection` |
+| Camera | `camerawesome` (video + concurrent face analysis) |
+| Face detection | `google_mlkit_face_detection` (must stay visible for full 30s) |
 | Polar BLE | `polar` (official SDK wrapper) |
 | Storage | `path_provider` + session folders under app documents |
 

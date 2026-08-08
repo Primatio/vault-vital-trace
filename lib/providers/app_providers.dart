@@ -32,6 +32,11 @@ final faceOverlayProvider = StreamProvider<FaceOverlayState>((ref) {
   return camera.faceStream;
 });
 
+final cameraReadyProvider = StreamProvider<bool>((ref) {
+  final camera = ref.watch(cameraServiceProvider);
+  return camera.readyStream;
+});
+
 final recordingControllerProvider = Provider<RecordingSessionController>((ref) {
   final controller = RecordingSessionController(
     polarService: ref.watch(polarServiceProvider),

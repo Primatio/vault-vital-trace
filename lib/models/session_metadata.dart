@@ -50,6 +50,30 @@ class RecordingSettings {
       resolutionPreset: json['resolution_preset'] as String? ?? 'high',
     );
   }
+
+  RecordingSettings copyWith({
+    int? width,
+    int? height,
+    int? fps,
+    bool? hrStream,
+    bool? rrStream,
+    bool? ecgStream,
+    bool? accStream,
+    String? cameraLens,
+    String? resolutionPreset,
+  }) {
+    return RecordingSettings(
+      width: width ?? this.width,
+      height: height ?? this.height,
+      fps: fps ?? this.fps,
+      hrStream: hrStream ?? this.hrStream,
+      rrStream: rrStream ?? this.rrStream,
+      ecgStream: ecgStream ?? this.ecgStream,
+      accStream: accStream ?? this.accStream,
+      cameraLens: cameraLens ?? this.cameraLens,
+      resolutionPreset: resolutionPreset ?? this.resolutionPreset,
+    );
+  }
 }
 
 class DeviceInfoMeta {
