@@ -15,6 +15,13 @@ enum PolarConnectionState {
   error,
 }
 
+class HeartRatePoint {
+  final int timestampMs;
+  final int bpm;
+
+  const HeartRatePoint({required this.timestampMs, required this.bpm});
+}
+
 class PolarDeviceView {
   final String deviceId;
   final String name;
@@ -108,6 +115,8 @@ class PolarService {
   late final Polar _polar;
 
   final _stateController = StreamController<PolarLiveState>.broadcast();
+  final _hrHistoryController =
+      StreamController<List<HeartRatePoint>>.broadcast();
   PolarLiveState _state = const PolarLiveState();
 
   StreamSubscription<PolarDeviceInfo>? _scanSub;
@@ -118,14 +127,28 @@ class PolarService {
 
   /// Buffer of samples collected while [isRecording] is true.
   final List<PolarSample> _recordingBuffer = [];
+  final List<HeartRatePoint> _hrHistory = [];
   bool _isRecording = false;
   int? _recordingStartMonotonicMs;
+
+  /// Rolling window shown on the live HR graph.
+  static const hrHistoryWindowMs = 60 * 1000;
+  static const hrHistoryMaxPoints = 180;
 
   PolarLiveState get state => _state;
   Stream<PolarLiveState> get stateStream async* {
     yield _state;
     yield* _stateController.stream;
   }
+
+  List<HeartRatePoint> get hrHistory =>
+      List<HeartRatePoint>.unmodifiable(_hrHistory);
+
+  Stream<List<HeartRatePoint>> get hrHistoryStream async* {
+    yield hrHistory;
+    yield* _hrHistoryController.stream;
+  }
+
   List<PolarSample> get recordingBuffer =>
       List<PolarSample>.unmodifiable(_recordingBuffer);
   bool get isRecording => _isRecording;
@@ -162,6 +185,10 @@ class PolarService {
       }),
       _polar.deviceDisconnected.listen((event) {
         _stopStreamSubs();
+        _hrHistory.clear();
+        if (!_hrHistoryController.isClosed) {
+          _hrHistoryController.add(const []);
+        }
         _emit(
           _state.copyWith(
             connectionState: PolarConnectionState.disconnected,
@@ -373,6 +400,19 @@ class PolarService {
     );
   }
 
+  void _appendHrHistory(int bpm) {
+    final now = MonotonicClock.nowMs();
+    _hrHistory.add(HeartRatePoint(timestampMs: now, bpm: bpm));
+    final cutoff = now - hrHistoryWindowMs;
+    _hrHistory.removeWhere((p) => p.timestampMs < cutoff);
+    while (_hrHistory.length > hrHistoryMaxPoints) {
+      _hrHistory.removeAt(0);
+    }
+    if (!_hrHistoryController.isClosed) {
+      _hrHistoryController.add(hrHistory);
+    }
+  }
+
   void _onHrData(PolarHrData data) {
     for (final sample in data.samples) {
       _emit(
@@ -383,6 +423,9 @@ class PolarService {
           hrStreaming: true,
         ),
       );
+      if (sample.hr > 0) {
+        _appendHrHistory(sample.hr);
+      }
 
       if (!_isRecording || _recordingStartMonotonicMs == null) continue;
 
@@ -484,5 +527,6 @@ class PolarService {
     }
     _lifecycleSubs.clear();
     await _stateController.close();
+    await _hrHistoryController.close();
   }
 }

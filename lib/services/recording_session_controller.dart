@@ -81,11 +81,13 @@ class RecordingSessionController {
     required this.polarService,
     required this.cameraService,
     required this.storage,
+    this.onStateChanged,
   });
 
   final PolarService polarService;
   final CameraService cameraService;
   final SessionStorageService storage;
+  void Function(RecordingUiState state)? onStateChanged;
 
   static const recordingDuration = Duration(seconds: 30);
 
@@ -95,14 +97,15 @@ class RecordingSessionController {
   /// Face must be missing this long before the take is discarded.
   static const faceLostGrace = Duration(milliseconds: 800);
 
-  final _stateController = StreamController<RecordingUiState>.broadcast();
   RecordingUiState _state = const RecordingUiState();
 
   Timer? _countdownTimer;
   Timer? _faceLockTimer;
+  Timer? _faceWatchTimer;
   StreamSubscription<FaceOverlayState>? _faceSub;
   DateTime? _faceLostSince;
   DateTime? _faceVisibleSince;
+  DateTime? _countdownStartedAt;
   bool _aborting = false;
   bool _startingTake = false;
 
@@ -113,18 +116,11 @@ class RecordingSessionController {
   Directory? _sessionDir;
   String? _folderName;
 
-  Stream<RecordingUiState> get stateStream async* {
-    yield _state;
-    yield* _stateController.stream;
-  }
-
   RecordingUiState get state => _state;
 
   void _emit(RecordingUiState next) {
     _state = next;
-    if (!_stateController.isClosed) {
-      _stateController.add(next);
-    }
+    onStateChanged?.call(next);
   }
 
   /// Arms a session. The 30s clock starts only after a stable face lock.
@@ -164,6 +160,7 @@ class RecordingSessionController {
     _aborting = false;
     _startingTake = false;
     _faceLostSince = null;
+    _countdownStartedAt = null;
     _faceVisibleSince =
         cameraService.faceState.detected ? DateTime.now() : null;
 
@@ -259,8 +256,14 @@ class RecordingSessionController {
       cameraService.beginFaceEventBuffer(startMonotonicMs: _startMonotonicMs!);
       polarService.beginRecordingBuffer(startMonotonicMs: _startMonotonicMs!);
 
-      await cameraService.startVideoRecording();
-      await _hapticStart();
+      await cameraService.startVideoRecording().timeout(
+        const Duration(seconds: 15),
+        onTimeout: () =>
+            throw TimeoutException('Camera recording start timed out'),
+      );
+
+      // Never block the 30s clock on haptics.
+      unawaited(_hapticStart());
 
       _emit(
         _state.copyWith(
@@ -289,12 +292,21 @@ class RecordingSessionController {
 
   void _listenForFaceDuringRecording() {
     _faceSub?.cancel();
-    _faceSub = cameraService.faceStream.listen((face) {
+    _faceSub = null;
+    _faceWatchTimer?.cancel();
+    _faceLostSince = null;
+
+    // Poll face presence: the face stream only emits on changes, so a
+    // continuous "face out" would never re-trigger the grace check.
+    _faceWatchTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (_state.phase != RecordingPhase.recording || _aborting) return;
 
-      _emit(_state.copyWith(faceDetected: face.detected));
+      final detected = cameraService.faceState.detected;
+      if (detected != _state.faceDetected) {
+        _emit(_state.copyWith(faceDetected: detected));
+      }
 
-      if (face.detected) {
+      if (detected) {
         _faceLostSince = null;
         return;
       }
@@ -312,6 +324,8 @@ class RecordingSessionController {
     _aborting = true;
 
     _countdownTimer?.cancel();
+    _faceWatchTimer?.cancel();
+    _faceWatchTimer = null;
     await _faceSub?.cancel();
     _faceSub = null;
 
@@ -348,19 +362,20 @@ class RecordingSessionController {
   void _startCountdown() {
     _countdownTimer?.cancel();
     final totalMs = recordingDuration.inMilliseconds;
-    final startedAt = DateTime.now();
+    _countdownStartedAt = DateTime.now();
 
-    _countdownTimer = Timer.periodic(const Duration(milliseconds: 100), (
-      timer,
-    ) async {
+    void tick() {
       if (_aborting || _state.phase != RecordingPhase.recording) {
-        timer.cancel();
+        _countdownTimer?.cancel();
         return;
       }
 
+      final startedAt = _countdownStartedAt;
+      if (startedAt == null) return;
+
       final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
-      final remainingMs = (totalMs - elapsed).clamp(0, totalMs);
-      final remainingSec = (remainingMs / 1000).ceil();
+      final remainingSec =
+          (recordingDuration.inSeconds - (elapsed ~/ 1000)).clamp(0, 30);
       final progress = (elapsed / totalMs).clamp(0.0, 1.0);
 
       _emit(
@@ -373,10 +388,16 @@ class RecordingSessionController {
       );
 
       if (elapsed >= totalMs) {
-        timer.cancel();
-        await _finish(cancelled: false);
+        _countdownTimer?.cancel();
+        unawaited(_finish(cancelled: false));
       }
-    });
+    }
+
+    tick();
+    _countdownTimer = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) => tick(),
+    );
   }
 
   Future<void> cancelSession() async {
@@ -389,6 +410,8 @@ class RecordingSessionController {
     _countdownTimer?.cancel();
     _faceLockTimer?.cancel();
     _faceLockTimer = null;
+    _faceWatchTimer?.cancel();
+    _faceWatchTimer = null;
     await _faceSub?.cancel();
     _faceSub = null;
 
@@ -411,6 +434,8 @@ class RecordingSessionController {
     _countdownTimer?.cancel();
     _faceLockTimer?.cancel();
     _faceLockTimer = null;
+    _faceWatchTimer?.cancel();
+    _faceWatchTimer = null;
     await _faceSub?.cancel();
     _faceSub = null;
     polarService.discardRecordingBuffer();
@@ -426,6 +451,8 @@ class RecordingSessionController {
   Future<void> _finish({required bool cancelled}) async {
     if (_aborting) return;
     _countdownTimer?.cancel();
+    _faceWatchTimer?.cancel();
+    _faceWatchTimer = null;
     await _faceSub?.cancel();
     _faceSub = null;
     _emit(_state.copyWith(phase: RecordingPhase.saving));
@@ -562,18 +589,24 @@ class RecordingSessionController {
 
   Future<void> _hapticStart() async {
     try {
-      await HapticFeedback.mediumImpact();
-      if (await Vibration.hasVibrator()) {
-        await Vibration.vibrate(duration: 80);
+      await HapticFeedback.mediumImpact()
+          .timeout(const Duration(milliseconds: 300));
+      if (await Vibration.hasVibrator()
+          .timeout(const Duration(milliseconds: 300), onTimeout: () => false)) {
+        await Vibration.vibrate(duration: 80)
+            .timeout(const Duration(milliseconds: 500));
       }
     } catch (_) {}
   }
 
   Future<void> _hapticStop() async {
     try {
-      await HapticFeedback.heavyImpact();
-      if (await Vibration.hasVibrator()) {
-        await Vibration.vibrate(duration: 120);
+      await HapticFeedback.heavyImpact()
+          .timeout(const Duration(milliseconds: 300));
+      if (await Vibration.hasVibrator()
+          .timeout(const Duration(milliseconds: 300), onTimeout: () => false)) {
+        await Vibration.vibrate(duration: 120)
+            .timeout(const Duration(milliseconds: 500));
       }
     } catch (_) {}
   }
@@ -582,16 +615,20 @@ class RecordingSessionController {
     _countdownTimer?.cancel();
     _faceLockTimer?.cancel();
     _faceLockTimer = null;
+    _faceWatchTimer?.cancel();
+    _faceWatchTimer = null;
     _faceSub?.cancel();
     _faceSub = null;
     _faceVisibleSince = null;
+    _countdownStartedAt = null;
     _emit(const RecordingUiState());
   }
 
   void dispose() {
     _countdownTimer?.cancel();
     _faceLockTimer?.cancel();
+    _faceWatchTimer?.cancel();
     _faceSub?.cancel();
-    _stateController.close();
+    onStateChanged = null;
   }
 }

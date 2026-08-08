@@ -21,6 +21,11 @@ final polarStateProvider = StreamProvider<PolarLiveState>((ref) {
   return service.stateStream;
 });
 
+final heartRateHistoryProvider = StreamProvider<List<HeartRatePoint>>((ref) {
+  final service = ref.watch(polarServiceProvider);
+  return service.hrHistoryStream;
+});
+
 final cameraServiceProvider = Provider<CameraService>((ref) {
   final service = CameraService();
   ref.onDispose(service.closeStreams);
@@ -37,20 +42,30 @@ final cameraReadyProvider = StreamProvider<bool>((ref) {
   return camera.readyStream;
 });
 
-final recordingControllerProvider = Provider<RecordingSessionController>((ref) {
-  final controller = RecordingSessionController(
-    polarService: ref.watch(polarServiceProvider),
-    cameraService: ref.watch(cameraServiceProvider),
-    storage: ref.watch(sessionStorageProvider),
-  );
-  ref.onDispose(controller.dispose);
-  return controller;
-});
+/// Bridges [RecordingSessionController] emissions into Riverpod 3 [Notifier] state
+/// so countdown ticks always rebuild the UI.
+class RecordingSessionNotifier extends Notifier<RecordingUiState> {
+  late final RecordingSessionController _controller;
 
-final recordingStateProvider = StreamProvider<RecordingUiState>((ref) {
-  final controller = ref.watch(recordingControllerProvider);
-  return controller.stateStream;
-});
+  RecordingSessionController get controller => _controller;
+
+  @override
+  RecordingUiState build() {
+    _controller = RecordingSessionController(
+      polarService: ref.watch(polarServiceProvider),
+      cameraService: ref.watch(cameraServiceProvider),
+      storage: ref.watch(sessionStorageProvider),
+      onStateChanged: (next) => state = next,
+    );
+    ref.onDispose(_controller.dispose);
+    return _controller.state;
+  }
+}
+
+final recordingControllerProvider =
+    NotifierProvider<RecordingSessionNotifier, RecordingUiState>(
+  RecordingSessionNotifier.new,
+);
 
 final sessionsListProvider =
     AsyncNotifierProvider<SessionsListNotifier, List<SessionSummary>>(

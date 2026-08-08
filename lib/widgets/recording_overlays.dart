@@ -15,34 +15,59 @@ class FaceGuideOverlay extends StatelessWidget {
     final color = faceDetected ? AppColors.accent : Colors.white70;
 
     return IgnorePointer(
-      child: Center(
-        child: AspectRatio(
-          aspectRatio: 3 / 4,
-          child: Container(
-            margin: const EdgeInsets.symmetric(horizontal: 48, vertical: 40),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(160),
-              border: Border.all(color: color, width: 2.5),
-            ),
-            child: Align(
-              alignment: Alignment.bottomCenter,
-              child: Padding(
-                padding: const EdgeInsets.only(bottom: 20),
-                child: Text(
-                  faceDetected ? 'Face detected' : 'Center your face',
-                  style: TextStyle(
-                    color: color,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 13,
-                    shadows: const [
-                      Shadow(blurRadius: 8, color: Colors.black54),
-                    ],
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxW = constraints.maxWidth;
+          final maxH = constraints.maxHeight;
+          if (maxW <= 0 || maxH <= 0) {
+            return const SizedBox.shrink();
+          }
+
+          // Keep oval inside the camera slot with proportional padding.
+          final padX = (maxW * 0.12).clamp(12.0, 36.0);
+          final padY = (maxH * 0.08).clamp(8.0, 28.0);
+          final availableW = maxW - padX * 2;
+          final availableH = maxH - padY * 2;
+          const aspect = 3 / 4; // width / height
+
+          late final double ovalW;
+          late final double ovalH;
+          if (availableW / availableH > aspect) {
+            ovalH = availableH;
+            ovalW = ovalH * aspect;
+          } else {
+            ovalW = availableW;
+            ovalH = ovalW / aspect;
+          }
+
+          return Center(
+            child: Container(
+              width: ovalW,
+              height: ovalH,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(ovalW / 2),
+                border: Border.all(color: color, width: 2.5),
+              ),
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: EdgeInsets.only(bottom: (ovalH * 0.08).clamp(8.0, 18.0)),
+                  child: Text(
+                    faceDetected ? 'Face detected' : 'Center your face',
+                    style: TextStyle(
+                      color: color,
+                      fontWeight: FontWeight.w600,
+                      fontSize: (ovalW * 0.045).clamp(11.0, 14.0),
+                      shadows: const [
+                        Shadow(blurRadius: 8, color: Colors.black54),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }

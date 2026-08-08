@@ -45,6 +45,7 @@ class CameraService {
   bool _isBusy = false;
   bool _isRecordingVideo = false;
   bool _cameraReady = false;
+  bool _audioMuteRequested = false;
   int? _sessionStartMonotonicMs;
   String? _currentVideoPath;
 
@@ -103,6 +104,7 @@ class CameraService {
         _videoState = videoState;
         _recordingState = null;
         _setReady(true);
+        _requestMuteAudio(videoState);
       },
       onVideoRecordingMode: (recordingState) {
         _recordingState = recordingState;
@@ -113,6 +115,16 @@ class CameraService {
       onPreviewMode: (_) {},
       onAnalysisOnlyMode: (_) {},
     );
+  }
+
+  /// Mute mic once camera is ready.
+  ///
+  /// CamerAwesome iOS never completes [VideoCameraState.enableAudio], so we
+  /// must not await it. The native side still applies the flag.
+  void _requestMuteAudio(VideoCameraState videoState) {
+    if (_audioMuteRequested) return;
+    _audioMuteRequested = true;
+    unawaited(videoState.enableAudio(false));
   }
 
   void _setReady(bool ready) {
@@ -221,13 +233,21 @@ class CameraService {
   }
 
   Future<void> startVideoRecording() async {
-    final videoState = _videoState;
+    if (_isRecordingVideo) return;
+
+    // Wait briefly if the builder hasn't attached VideoCameraState yet.
+    var videoState = _videoState;
+    for (var i = 0; i < 40 && videoState == null; i++) {
+      await Future.delayed(const Duration(milliseconds: 25));
+      videoState = _videoState;
+    }
     if (videoState == null) {
       throw StateError('Camera not ready for video recording');
     }
-    if (_isRecordingVideo) return;
 
-    await videoState.enableAudio(false);
+    // Do NOT call enableAudio() here: CamerAwesome's iOS
+    // setRecordingAudioMode never invokes its completion handler, so
+    // awaiting it hangs forever. Audio is already disabled via SaveConfig.
     final request = await videoState.startRecording();
     _currentVideoPath = request.path;
     _setRecording(true);
@@ -304,6 +324,7 @@ class CameraService {
     _faceDetector = null;
     _videoState = null;
     _recordingState = null;
+    _audioMuteRequested = false;
     _setRecording(false);
     _cameraReady = false;
     _faceState = const FaceOverlayState();
