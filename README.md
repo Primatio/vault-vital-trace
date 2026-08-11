@@ -119,6 +119,24 @@ At take start the app records wall-clock UTC and device monotonic milliseconds. 
 
 Do not commit real participant sessions into git. Sample folders under `scripts/sample_session*` are gitignored.
 
+## Citing
+
+If you use this software in academic work, please cite it. GitHub also exposes **Cite this repository** from [`CITATION.cff`](CITATION.cff).
+
+```bibtex
+@software{VaultRPPGCollector2026,
+  author       = {Andrade, Felipe and Primatio},
+  title        = {Vault rPPG Collector},
+  year         = {2026},
+  version      = {0.1.0},
+  publisher    = {Zenodo},
+  url          = {https://github.com/Primatio/vault-vital-trace},
+  note         = {Replace with the Zenodo DOI once the archive is published}
+}
+```
+
+After the Zenodo archive for release `v0.1.0` is live, the DOI will be added to [`CITATION.cff`](CITATION.cff) and this section. Setup steps: [`docs/ZENODO.md`](docs/ZENODO.md).
+
 ## License
 
 Copyright © 2026 **Primatio** and **Felipe Andrade**.

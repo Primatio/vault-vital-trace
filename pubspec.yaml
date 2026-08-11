@@ -1,7 +1,7 @@
 name: vault_rppg_collector
 description: Primatio Vault rPPG Collector — synchronized facial video + Polar H10 ground-truth for rPPG research.
 publish_to: 'none'
-version: 1.0.0+1
+version: 0.1.0+1
 
 environment:
   sdk: ^3.10.0
