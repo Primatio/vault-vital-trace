@@ -29,6 +29,6 @@ keywords:
   - synchronized recording
 # After Zenodo archives release v0.1.0, uncomment and fill:
 # identifiers:
-#   - type: doi
-#     value: 10.5281/zenodo.XXXXXXX
-#     description: Software archive on Zenodo
+  - type: doi
+    value: 10.5281/zenodo.21895387
+    description: Software archive on Zenodo

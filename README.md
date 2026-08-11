@@ -135,7 +135,7 @@ If you use this software in academic work, please cite it. GitHub also exposes *
 }
 ```
 
-After the Zenodo archive for release `v0.1.0` is live, the DOI will be added to [`CITATION.cff`](CITATION.cff) and this section. Setup steps: [`docs/ZENODO.md`](docs/ZENODO.md).
+[![DOI](https://zenodo.org/badge/1327183290.svg)](https://doi.org/10.5281/zenodo.21895387)
 
 ## License
 
