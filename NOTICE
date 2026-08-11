@@ -1,0 +1,16 @@
+Vault rPPG Collector
+Copyright 2026 Primatio
+Copyright 2026 Felipe Andrade
+
+This product includes software developed by Primatio and contributors.
+Attribution must be retained in source and binary redistributions as required
+by the Apache License, Version 2.0.
+
+Project: https://github.com/Primatio/vault-vital-trace
+
+---
+
+Third-party components are copyright their respective owners and remain under
+their original licenses (including, among others: Flutter, CamerAwesome,
+Google ML Kit Face Detection, Polar BLE SDK / polar Dart package, Riverpod,
+and other dependencies declared in pubspec.yaml / ios/Podfile.lock).

@@ -1,0 +1,126 @@
+# Vault rPPG Collector — Data Format
+
+Schema version embedded in `metadata.json` as `schema_version` (currently **2**).
+
+## Session directory
+
+```
+session_YYYYMMDD_HHMMSS_<subjectID>/
+├── video.mp4              # Front-camera recording (~30 s)
+├── polar_data.csv         # Polar H10 samples
+├── metadata.json          # Session + device + sync metadata
+└── face_tracking.json     # Face-detection events (best-effort)
+```
+
+Folder names use the device local clock for the `YYYYMMDD_HHMMSS` segment; absolute times inside `metadata.json` are UTC.
+
+## metadata.json
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema_version` | int | Format version |
+| `session_id` | string | Same as folder name by default |
+| `subject_id` | string | Operator-entered subject identifier |
+| `folder_name` | string | On-disk directory basename |
+| `start_utc` / `end_utc` | ISO-8601 | Wall-clock UTC |
+| `start_monotonic_ms` / `end_monotonic_ms` | int | Device monotonic clock (ms since process start) |
+| `duration_ms` | int \| null | `end_monotonic_ms - start_monotonic_ms` |
+| `device_info` | object | Phone model, OS, app version/build |
+| `polar_device` | object | Device ID, name, firmware, battery |
+| `recording_settings` | object | Resolution, FPS target, which streams were active |
+| `notes` | string \| null | Free-text notes |
+| `status` | string | `complete` \| `incomplete` \| `cancelled` |
+| `face_detected_at_start` | bool | ML Kit face present at recording start |
+| `face_detection_event_count` | int \| null | Rows in `face_tracking.json` |
+| `app_version` | string | App semver |
+| `blood_pressure` | object | Cuff BP entered before/after the 30s take |
+
+### blood_pressure
+
+Operator-entered cuff readings (VitalVideos-style spot BP), not continuous arterial waveform.
+
+```json
+{
+  "start": { "systolic_mmhg": 120, "diastolic_mmhg": 80 },
+  "end": { "systolic_mmhg": 118, "diastolic_mmhg": 78 }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `start` | object \| null | BP measured **before** Start 30s |
+| `end` | object \| null | BP measured **after** the 30s video |
+| `*.systolic_mmhg` | int | Systolic pressure in mmHg |
+| `*.diastolic_mmhg` | int | Diastolic pressure in mmHg |
+
+A session is marked `complete` only after end BP is saved. If the operator leaves after video save without end BP, status stays `incomplete` with `blood_pressure.end = null`.
+
+### recording_settings
+
+```json
+{
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "hr_stream": true,
+  "rr_stream": true,
+  "ecg_stream": true,
+  "acc_stream": false,
+  "camera_lens": "front",
+  "resolution_preset": "high"
+}
+```
+
+## polar_data.csv
+
+Header:
+
+```
+timestamp_ms,utc,hr_bpm,rr_ms,ecg_uv,acc_x,acc_y,acc_z
+```
+
+| Column | Unit | Notes |
+|--------|------|-------|
+| `timestamp_ms` | ms | Relative to session `start_monotonic_ms` |
+| `utc` | ISO-8601 | Wall clock at sample capture (may be empty) |
+| `hr_bpm` | bpm | From HR stream |
+| `rr_ms` | ms | RR interval when present (may be on its own row) |
+| `ecg_uv` | µV | ECG sample (~130 Hz when streaming) |
+| `acc_x/y/z` | mG | Optional accelerometer |
+
+Rows are **heterogeneous**: a row may populate only ECG, only HR, or HR+RR. Empty fields are left blank. Sort by `timestamp_ms` for chronological order (ECG arrives much denser than HR).
+
+## face_tracking.json
+
+```json
+{
+  "event_count": 1,
+  "events": [
+    {
+      "timestamp_ms": 0,
+      "face_detected": true,
+      "face_count": 1,
+      "smiling_probability": 0.1,
+      "left_eye_open_probability": 0.9,
+      "right_eye_open_probability": 0.9,
+      "head_euler_y": 2.1,
+      "head_euler_z": -1.4
+    }
+  ]
+}
+```
+
+Face detection runs continuously during the 30-second take (CamerAwesome image analysis + ML Kit). If the face leaves the frame for ~800 ms, the take is discarded and must be restarted. Events are sampled ~5 Hz into this file.
+
+## Synchronization guidance for ML engineers
+
+1. Treat `timestamp_ms == 0` as the intended video/sensor sync epoch.
+2. Video length should be ≈ `duration_ms` (typically ~30000 ms).
+3. Prefer ECG when `ecg_stream` is true; otherwise derive HRV features from `rr_ms`.
+4. If sub-frame alignment is required, cross-correlate ECG/HR with rPPG estimates offline and apply a constant offset.
+
+## Privacy
+
+Sessions are stored only in the app documents directory until an operator uses **Export / Share**. No automatic Google Bucket upload is performed in the MVP app; upload is an external step after export.
+
+**The collector does not phone home.** Primatio does not receive your recordings through this software. Face video + physiological signals + blood pressure are **sensitive health / biometric data** (LGPD art. 5º, II). Opening the *code* under Apache-2.0 does **not** authorize opening *datasets*. Before collecting from third parties or publishing recordings, obtain informed consent, CEP approval when required (CNS 466/2012), and a LGPD-compliant process. Facial video is effectively non-anonymizable without destroying the rPPG signal — see the Ethics section in [`README.md`](../README.md).
