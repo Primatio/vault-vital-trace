@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -9,6 +11,18 @@ import 'package:share_plus/share_plus.dart';
 import '../models/polar_sample.dart';
 import '../models/session_metadata.dart';
 import '../models/session_summary.dart';
+
+class _UploadFile {
+  const _UploadFile({
+    required this.field,
+    required this.localName,
+    this.sentName,
+  });
+
+  final String field;
+  final String localName;
+  final String? sentName;
+}
 
 class SessionStorageService {
   static const sessionsRootName = 'sessions';
@@ -161,6 +175,83 @@ class SessionStorageService {
         text: 'Vault rPPG session: ${p.basename(directoryPath)}',
       ),
     );
+  }
+
+  // Configured via .env (see .env.example). NOTE: localhost refers to the
+  // device itself, not your dev machine, so a real phone must target your
+  // computer's LAN IP. Update SESSION_UPLOAD_URL if your machine's IP changes
+  // (e.g. after reconnecting to Wi-Fi).
+  static const _apiKeyHeader = 'x-api-key';
+
+  String get _sessionUploadUrl {
+    final url = dotenv.env['SESSION_UPLOAD_URL'];
+    if (url == null || url.isEmpty) {
+      throw StateError(
+        'SESSION_UPLOAD_URL is not set. Copy .env.example to .env and fill it in.',
+      );
+    }
+    return url;
+  }
+
+  // Must match API_KEY in the vault-vital-trace-api .env, sent in the header
+  // named by API_KEY_HEADER (defaults to x-api-key).
+  String get _apiKey {
+    final key = dotenv.env['SESSION_UPLOAD_API_KEY'];
+    if (key == null || key.isEmpty) {
+      throw StateError(
+        'SESSION_UPLOAD_API_KEY is not set. Copy .env.example to .env and fill it in.',
+      );
+    }
+    return key;
+  }
+
+  // Maps the local session file to the multipart field name the API expects
+  // (see UPLOAD_FIELDS in the API). The API validates by the extension of the
+  // sent filename, so the video is uploaded as .mov.
+  static const _uploadFields = <_UploadFile>[
+    _UploadFile(field: 'videoFile', localName: 'video.mp4', sentName: 'video.mov'),
+    _UploadFile(field: 'jsonFile1', localName: 'metadata.json'),
+    _UploadFile(field: 'jsonFile2', localName: 'face_tracking.json'),
+    _UploadFile(field: 'csvFile', localName: 'polar_data.csv'),
+  ];
+
+  Future<void> uploadSession({
+    required String directoryPath,
+    required String sessionId,
+  }) async {
+    final dir = Directory(directoryPath);
+    if (!await dir.exists()) {
+      throw StateError('Session directory does not exist');
+    }
+
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse(_sessionUploadUrl),
+    );
+    request.headers[_apiKeyHeader] = _apiKey;
+    request.fields['sessionId'] = sessionId;
+
+    for (final spec in _uploadFields) {
+      final file = File(p.join(dir.path, spec.localName));
+      if (!await file.exists()) {
+        throw StateError('Missing required file for upload: ${spec.localName}');
+      }
+      request.files.add(
+        await http.MultipartFile.fromPath(
+          spec.field,
+          file.path,
+          filename: spec.sentName ?? spec.localName,
+        ),
+      );
+    }
+
+    final response = await request.send();
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      final body = await response.stream.bytesToString();
+      throw HttpException(
+        'Upload failed (${response.statusCode}): $body',
+      );
+    }
   }
 
   Future<Map<String, int>> fileSizes(String directoryPath) async {
