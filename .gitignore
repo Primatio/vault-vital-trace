@@ -54,11 +54,16 @@ app.*.map.json
 # Secrets / local env
 .env
 .env.*
+!.env.example
 *.pem
 **/google-services.json
 **/GoogleService-Info.plist
 **/credentials*.json
 **/service-account*.json
+
+# Node / JS build output
+**/node_modules/
+**/dist/
 
 # Local participant data (never commit)
 **/session_*/

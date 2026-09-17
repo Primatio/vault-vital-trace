@@ -25,6 +25,8 @@ class SessionDetailScreen extends ConsumerStatefulWidget {
       _SessionDetailScreenState();
 }
 
+enum _ExportChoice { share, upload }
+
 class _SessionDetailScreenState extends ConsumerState<SessionDetailScreen> {
   late SessionSummary _summary;
   Map<String, int> _files = {};
@@ -51,9 +53,57 @@ class _SessionDetailScreenState extends ConsumerState<SessionDetailScreen> {
   }
 
   Future<void> _export() async {
-    await ref
-        .read(sessionStorageProvider)
-        .shareSession(_summary.directoryPath);
+    final choice = await showModalBottomSheet<_ExportChoice>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.ios_share),
+              title: const Text('Share…'),
+              subtitle: const Text('Share session files via the system share sheet'),
+              onTap: () => Navigator.pop(ctx, _ExportChoice.share),
+            ),
+            ListTile(
+              leading: const Icon(Icons.cloud_upload_outlined),
+              title: const Text('Upload to server'),
+              subtitle: const Text('POST session files to server'),
+              onTap: () => Navigator.pop(ctx, _ExportChoice.upload),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (choice == _ExportChoice.share) {
+      await ref
+          .read(sessionStorageProvider)
+          .shareSession(_summary.directoryPath);
+    } else if (choice == _ExportChoice.upload) {
+      await _upload();
+    }
+  }
+
+  Future<void> _upload() async {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Uploading session…')),
+    );
+    try {
+      await ref.read(sessionStorageProvider).uploadSession(
+            directoryPath: _summary.directoryPath,
+            sessionId: _summary.metadata.sessionId,
+          );
+      if (!mounted) return;
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Session uploaded successfully')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text('Upload failed: $e')),
+      );
+    }
   }
 
   Future<void> _delete() async {
